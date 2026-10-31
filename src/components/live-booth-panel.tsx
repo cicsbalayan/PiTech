@@ -1,10 +1,9 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type FormEvent } from "react"
 import frameCutout from "@/assets/frame-cutout.png"
 import { Camera3D, Download3D } from "@/components/icons-3d"
-import { useAuth } from "@/components/auth-provider"
 import { isSupabaseConfigured, supabase } from "@/lib/supabase"
 import { IDENTITY_TRANSFORM } from "@/lib/photo-transform"
-import { SwitchCamera } from "lucide-react"
+import { Copy, Maximize2, Minimize2, Monitor, SwitchCamera } from "lucide-react"
 import { composeFrame } from "@/lib/compose-frame"
 
 type BoothRole = "camera" | "display" | null
@@ -13,7 +12,14 @@ type LiveBoothPanelProps = {
   onExported?: (blob: Blob, name: string) => void
 }
 
-const channelName = (userId: string) => `pitech-photo-booth:${userId}`
+const PAIRING_CODE_LENGTH = 6
+const channelName = (code: string) => `pitech-photo-booth:pair:${code}`
+
+function createPairingCode() {
+  const value = new Uint32Array(1)
+  crypto.getRandomValues(value)
+  return String(100000 + (value[0] % 900000))
+}
 
 function captureVideoFrame(
   video: HTMLVideoElement | null,
@@ -58,15 +64,26 @@ async function requestCamera(mode: "user" | "environment") {
 }
 
 export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
-  const { user } = useAuth()
   const [role, setRole] = useState<BoothRole>(null)
   const [status, setStatus] = useState("Choose a device role to begin.")
   const [facingMode, setFacingMode] = useState<"user" | "environment">("user")
+  const [pairingCode, setPairingCode] = useState("")
+  const [codeInput, setCodeInput] = useState("")
+  const [isFullscreen, setIsFullscreen] = useState(false)
   const localVideoRef = useRef<HTMLVideoElement>(null)
   const remoteVideoRef = useRef<HTMLVideoElement>(null)
+  const displayStageRef = useRef<HTMLDivElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const peerRef = useRef<RTCPeerConnection | null>(null)
   const channelRef = useRef<ReturnType<NonNullable<typeof supabase>["channel"]> | null>(null)
+
+  useEffect(() => {
+    const syncFullscreen = () => {
+      setIsFullscreen(document.fullscreenElement === displayStageRef.current)
+    }
+    document.addEventListener("fullscreenchange", syncFullscreen)
+    return () => document.removeEventListener("fullscreenchange", syncFullscreen)
+  }, [])
 
   const startCamera = async (mode: "user" | "environment") => {
     const previousStream = streamRef.current
@@ -87,20 +104,24 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
     setFacingMode(mode)
     setStatus(
       mode === "user"
-        ? "Front camera active. The PC preview is ready."
-        : "Back camera active. The PC preview is ready.",
+        ? "Front camera active. Enter the code below on your display."
+        : "Back camera active. Enter the code below on your display.",
     )
   }
 
   useEffect(() => {
-    if (!role || !user || !supabase || !isSupabaseConfigured) return
+    if (!role || !pairingCode || !supabase || !isSupabaseConfigured) return
 
     let active = true
+    const localVideo = localVideoRef.current
+    const remoteVideo = remoteVideoRef.current
     const client = supabase
-    const channel = client.channel(channelName(user.id), {
+    const channel = client.channel(channelName(pairingCode), {
       config: { broadcast: { self: false } },
     })
     channelRef.current = channel
+    let offerStarted = false
+    const pendingCandidates: RTCIceCandidateInit[] = []
 
     const send = (payload: Signal) => {
       void channel.send({ type: "broadcast", event: "signal", payload })
@@ -108,14 +129,26 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
 
     const createPeer = () => {
       peerRef.current?.close()
-      const peer = new RTCPeerConnection()
+      const peer = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      })
       peerRef.current = peer
       peer.onicecandidate = (event) => {
         if (event.candidate) send({ type: "candidate", candidate: event.candidate })
       }
       peer.ontrack = (event) => {
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = event.streams[0]
+        if (remoteVideo) {
+          remoteVideo.srcObject = event.streams[0]
+        }
+        setStatus("Live camera connected. You can capture from either device.")
+      }
+      peer.onconnectionstatechange = () => {
+        if (peer.connectionState === "connected" && role === "camera") {
+          setStatus("Live display connected.")
+        } else if (peer.connectionState === "failed") {
+          setStatus("Could not connect. Check both devices are online and try again.")
+        } else if (peer.connectionState === "disconnected") {
+          setStatus("Display connection lost. Re-enter the code to reconnect.")
         }
       }
       return peer
@@ -124,22 +157,23 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
     const handleSignal = async ({ payload }: { payload: Signal }) => {
       if (!active) return
 
-      if (role === "camera" && payload.type === "display-ready") {
+      if (role === "camera" && payload.type === "display-ready" && !offerStarted) {
         const peer = createPeer()
         const stream = streamRef.current
         if (!stream) return
+        offerStarted = true
         stream.getTracks().forEach((track) => peer.addTrack(track, stream))
         const offer = await peer.createOffer()
         await peer.setLocalDescription(offer)
         send({ type: "offer", description: offer })
-        setStatus("Live preview connected to the PC.")
+        setStatus("Connecting to the display…")
       }
 
       if (role === "camera" && payload.type === "capture-request") {
-        const captured = captureVideoFrame(localVideoRef.current, (dataUrl) =>
+        const captured = captureVideoFrame(localVideo, (dataUrl) =>
           send({ type: "photo", dataUrl }),
         )
-        if (captured) setStatus("Photo captured and sent to the PC display.")
+        if (captured) setStatus("Photo captured and sent to the display.")
       }
 
       if (role === "display" && payload.type === "camera-ready") {
@@ -150,6 +184,11 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
         await peerRef.current.setRemoteDescription(
           payload.description as RTCSessionDescriptionInit,
         )
+        await Promise.all(
+          pendingCandidates.splice(0).map((candidate) =>
+            peerRef.current?.addIceCandidate(candidate),
+          ),
+        )
       }
 
       if (role === "display" && payload.type === "offer") {
@@ -157,14 +196,22 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
         await peer.setRemoteDescription(
           payload.description as RTCSessionDescriptionInit,
         )
+        await Promise.all(
+          pendingCandidates.splice(0).map((candidate) => peer.addIceCandidate(candidate)),
+        )
         const answer = await peer.createAnswer()
         await peer.setLocalDescription(answer)
         send({ type: "answer", description: answer })
-        setStatus("Live preview connected. Waiting for the mobile capture.")
+        setStatus("Connecting to the mobile camera…")
       }
 
-      if (payload.type === "candidate" && peerRef.current) {
-        await peerRef.current.addIceCandidate(payload.candidate as RTCIceCandidateInit)
+      if (payload.type === "candidate") {
+        const candidate = payload.candidate as RTCIceCandidateInit
+        if (peerRef.current?.remoteDescription) {
+          await peerRef.current.addIceCandidate(candidate)
+        } else {
+          pendingCandidates.push(candidate)
+        }
       }
 
       if (role === "display" && payload.type === "photo") {
@@ -182,7 +229,12 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
 
     channel.on("broadcast", { event: "signal" }, handleSignal)
     void channel.subscribe(async (subscriptionStatus) => {
-      if (subscriptionStatus !== "SUBSCRIBED") return
+      if (subscriptionStatus !== "SUBSCRIBED") {
+        if (active && ["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(subscriptionStatus)) {
+          setStatus("Could not connect to the pairing service. Check your internet connection and try again.")
+        }
+        return
+      }
       if (role === "camera") {
         try {
           const stream = await requestCamera("user")
@@ -191,11 +243,11 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
             return
           }
           streamRef.current = stream
-          if (localVideoRef.current) localVideoRef.current.srcObject = stream
-          setStatus("Camera ready. Open the PC Display role to start the preview.")
+          if (localVideo) localVideo.srcObject = stream
+          setStatus("Camera ready. Enter this code on the display to connect.")
           send({ type: "camera-ready" })
         } catch {
-          setStatus("Camera access was denied. Allow camera access and try again.")
+          setStatus("Could not start the camera. Check camera permission and try again.")
         }
       } else {
         send({ type: "display-ready" })
@@ -209,12 +261,48 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
       streamRef.current = null
       peerRef.current?.close()
       peerRef.current = null
-      if (localVideoRef.current) localVideoRef.current.srcObject = null
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null
+      if (localVideo) localVideo.srcObject = null
+      if (remoteVideo) remoteVideo.srcObject = null
       void client.removeChannel(channel)
       channelRef.current = null
     }
-  }, [onExported, role, user])
+  }, [onExported, pairingCode, role])
+
+  const connectDisplay = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const code = codeInput.replace(/\D/g, "").slice(0, PAIRING_CODE_LENGTH)
+    if (code.length !== PAIRING_CODE_LENGTH) return
+    setPairingCode(code)
+  }
+
+  const leaveRole = () => {
+    setPairingCode("")
+    setRole(null)
+    setStatus("Choose a device role to begin.")
+  }
+
+  const copyPairingCode = async () => {
+    try {
+      await navigator.clipboard.writeText(pairingCode)
+      setStatus("Pairing code copied. Enter it on the display.")
+    } catch {
+      setStatus("Could not copy the code. Enter it manually on the display.")
+    }
+  }
+
+  const toggleFullscreen = async () => {
+    const stage = displayStageRef.current
+    if (!stage) return
+    try {
+      if (document.fullscreenElement === stage) {
+        await document.exitFullscreen()
+      } else {
+        await stage.requestFullscreen()
+      }
+    } catch {
+      setStatus("Fullscreen is unavailable in this browser.")
+    }
+  }
 
   const switchCamera = async () => {
     if (role !== "camera") return
@@ -235,7 +323,7 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
         payload: { type: "photo", dataUrl },
       })
     })
-    if (captured) setStatus("Photo captured and sent to the PC display.")
+    if (captured) setStatus("Photo captured and sent to the display.")
   }
 
   if (!isSupabaseConfigured) {
@@ -243,7 +331,7 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
       <section className="neumorphic-card mx-auto flex w-full max-w-2xl flex-col gap-3 rounded-3xl p-8 text-center">
         <h2 className="text-2xl font-bold text-foreground">Live Photo Booth</h2>
         <p className="text-sm font-medium text-muted-foreground">
-          Configure Supabase to connect the mobile camera to the PC display.
+          Configure Supabase to connect the mobile camera to another display.
         </p>
       </section>
     )
@@ -257,13 +345,16 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
             Live Photo Booth
           </h2>
           <p className="mt-2 text-sm font-medium text-muted-foreground">
-            Use the mobile as the camera and the PC as the live preview screen.
+            Connect a mobile camera to any nearby screen with a one-time code.
           </p>
         </div>
         <div className="grid w-full gap-4 sm:grid-cols-2">
           <button
             type="button"
-            onClick={() => setRole("camera")}
+            onClick={() => {
+              setPairingCode(createPairingCode())
+              setRole("camera")
+            }}
             className="neumorphic-button flex min-h-32 flex-col items-center justify-center gap-3 rounded-3xl px-6 text-white"
           >
             <Camera3D size={30} />
@@ -275,9 +366,54 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
             className="neumorphic-button flex min-h-32 flex-col items-center justify-center gap-3 rounded-3xl px-6 text-white"
           >
             <Download3D size={30} />
-            <span className="font-semibold">PC Display</span>
+            <span className="font-semibold">Live Display</span>
           </button>
         </div>
+      </section>
+    )
+  }
+
+  if (role === "display" && !pairingCode) {
+    return (
+      <section className="neumorphic-card mx-auto flex w-full max-w-md flex-col items-center gap-5 rounded-3xl p-6 text-center sm:p-8">
+        <span className="icon-3d flex h-14 w-14 items-center justify-center rounded-2xl text-white">
+          <Monitor size={28} />
+        </span>
+        <div>
+          <h2 className="text-2xl font-bold text-foreground">Connect a camera</h2>
+          <p className="mt-2 text-sm font-medium text-muted-foreground">
+            Enter the six-digit code shown on the mobile camera.
+          </p>
+        </div>
+        <form onSubmit={connectDisplay} className="flex w-full flex-col gap-3">
+          <label htmlFor="booth-pairing-code" className="sr-only">
+            Six-digit pairing code
+          </label>
+          <input
+            id="booth-pairing-code"
+            autoComplete="one-time-code"
+            inputMode="numeric"
+            pattern="[0-9]{6}"
+            maxLength={PAIRING_CODE_LENGTH}
+            value={codeInput}
+            onChange={(event) =>
+              setCodeInput(event.target.value.replace(/\D/g, "").slice(0, PAIRING_CODE_LENGTH))
+            }
+            placeholder="000000"
+            className="w-full rounded-2xl border border-[#d3e8da] bg-white px-4 py-4 text-center font-mono text-3xl font-bold tracking-[0.35em] text-foreground outline-none focus:ring-2 focus:ring-[#16794a]"
+            required
+          />
+          <button
+            type="submit"
+            disabled={codeInput.length !== PAIRING_CODE_LENGTH}
+            className="neumorphic-button flex h-12 w-full items-center justify-center gap-2 rounded-2xl text-white disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Connect to camera
+          </button>
+        </form>
+        <button type="button" onClick={leaveRole} className="text-sm font-semibold text-[#16794a]">
+          Change device role
+        </button>
       </section>
     )
   }
@@ -299,6 +435,25 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
           </p>
           <h2 className="text-2xl font-bold text-foreground">Mobile Camera</h2>
           <p role="status" className="text-sm font-medium text-muted-foreground">{status}</p>
+          <div className="neumorphic-card flex w-full max-w-xs flex-col items-center gap-2 rounded-2xl p-4">
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Display connection code
+            </p>
+            <div className="flex w-full items-center justify-center gap-3">
+              <span className="font-mono text-3xl font-bold tracking-[0.3em] text-foreground">
+                {pairingCode}
+              </span>
+              <button
+                type="button"
+                onClick={() => void copyPairingCode()}
+                aria-label="Copy pairing code"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-[#16794a] hover:bg-[#eaf5ee]"
+              >
+                <Copy size={18} />
+              </button>
+            </div>
+            <p className="text-xs text-muted-foreground">Enter this code on the display device.</p>
+          </div>
           <div className="flex w-full max-w-xs flex-col gap-3">
           <button
             type="button"
@@ -317,7 +472,7 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
             <span className="font-semibold">Switch to {facingMode === "user" ? "Back" : "Front"} Camera</span>
           </button>
           </div>
-          <button type="button" onClick={() => setRole(null)} className="text-sm font-semibold text-[#16794a]">
+          <button type="button" onClick={leaveRole} className="text-sm font-semibold text-[#16794a]">
             Change device role
           </button>
         </div>
@@ -327,22 +482,31 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
 
   return (
     <section className="flex w-full flex-col items-center gap-8">
-      <div className="flex w-full max-w-6xl flex-col items-center gap-8 lg:flex-row lg:items-start lg:justify-center lg:gap-12">
-        <div className="relative w-full max-w-[min(90vw,560px)] shrink-0 overflow-hidden rounded-3xl bg-[#062b16] shadow-brand-lg">
+      <div className="flex w-full max-w-6xl flex-col items-center gap-6 lg:flex-row lg:items-start lg:justify-center lg:gap-12">
+        <div ref={displayStageRef} className="booth-display-stage relative w-full max-w-[min(90vw,560px)] shrink-0 overflow-hidden rounded-3xl bg-[#062b16] shadow-brand-lg">
           <video ref={remoteVideoRef} autoPlay playsInline className="aspect-square w-full object-cover" />
           <img
             src={frameCutout}
             alt="Photo booth frame guide"
             className="pointer-events-none absolute inset-0 h-full w-full"
           />
+          <button
+            type="button"
+            onClick={() => void toggleFullscreen()}
+            aria-label={isFullscreen ? "Exit fullscreen display" : "Show fullscreen display"}
+            title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+            className="absolute right-3 top-3 z-10 flex h-10 w-10 items-center justify-center rounded-xl bg-white/90 text-[#0b3a20] shadow-md"
+          >
+            {isFullscreen ? <Minimize2 size={20} /> : <Maximize2 size={20} />}
+          </button>
         </div>
         <div className="flex w-full max-w-md flex-col items-center gap-5 pt-2 text-center lg:pt-8">
-          <h2 className="text-2xl font-bold text-foreground">Photo Booth Controls</h2>
+          <h2 className="text-2xl font-bold text-foreground">Live Display</h2>
           <p role="status" className="text-sm font-medium text-muted-foreground">{status}</p>
           <div className="neumorphic-card w-full rounded-3xl p-6">
             <p className="text-sm font-medium text-muted-foreground">
-              Capture on the mobile camera. The PC preview stays square and
-              matches the mobile view without stretching.
+              The live camera feed appears here. Capture on the mobile camera,
+              or use this display to take a framed photo.
             </p>
           </div>
           <button
@@ -361,7 +525,7 @@ export function LiveBoothPanel({ onExported }: LiveBoothPanelProps) {
             <Camera3D size={22} />
             <span className="font-semibold">Take Photo</span>
           </button>
-          <button type="button" onClick={() => setRole(null)} className="text-sm font-semibold text-[#16794a]">
+          <button type="button" onClick={leaveRole} className="text-sm font-semibold text-[#16794a]">
             Change device role
           </button>
         </div>

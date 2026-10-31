@@ -10,7 +10,7 @@ saved, and downloaded.
 | App access | The workspace (live booth and gallery) is gated behind the shared PIN. |
 | Tabs | **Create** (frame + actions) and **My Images** (saved gallery). |
 | Frame container | `ASSETS/frame.png` — the photo is rendered inside the frame's window |
-| Live booth sync | Mobile publishes a WebRTC camera preview and captured stills to the PC over Supabase Realtime signaling |
+| Live booth sync | Mobile publishes a WebRTC camera preview and captured stills to a paired display over Supabase Realtime signaling |
 | Take Photo | Mobile camera only; the PC shows the live preview before capture |
 | Zoom & pan | The photo inside the frame can be moved and zoomed — drag to reposition, scroll or pinch to zoom, double-click / double-tap to reset, plus zoom-out / zoom-in / reset buttons and keyboard control. 100 % fills the frame's opening; zoom out to set the photo on the white mat |
 | Download | Exports the frame + photo as a 1080 × 1080 PNG — nothing else is stamped onto the export, no logos or branding |
@@ -54,15 +54,18 @@ on a `<canvas>` at 1080 × 1080.
 
 ### Live photo booth
 
-After signing in on both devices, open **Create** and choose **Mobile Camera**
-on the phone and **PC Display** on the computer. The phone camera stream is
-sent directly to the PC with WebRTC; Supabase Realtime is used only for the
-signaling handshake. Press **Capture Photo** on the phone to send a still to
-the PC, where it can be positioned in the frame and downloaded.
+After signing in, open **Create** on both devices. Choose **Mobile Camera** on
+the phone and **Live Display** on the screen. Enter the six-digit code shown on
+the phone into the display to pair them. The phone camera stream is sent directly
+to the display with WebRTC; Supabase Realtime is used only for the signaling
+handshake. Press **Capture Photo** on either device to send a still to the
+display, where it can be positioned in the frame and downloaded. The display
+can run on a PC, tablet, or another phone.
 
-Both devices must use the same Supabase-backed account and a secure origin
-(HTTPS, or localhost during development). The browser will ask the mobile
-device for camera permission.
+Supabase must be configured and both devices need internet access and a secure
+origin (HTTPS, or localhost during development). The browser will ask the mobile
+device for camera permission. Direct WebRTC connections may be unavailable on
+some restrictive networks that require a TURN relay.
 
 ### Zooming and moving the photo
 
